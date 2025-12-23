@@ -9,6 +9,7 @@
       --bg:#0b1020; --card:#111a33; --text:#eef2ff; --muted:#b7c2ff;
       --accent:#7aa2ff; --shadow: 0 12px 30px rgba(0,0,0,.35);
       --danger:#ff7a7a;
+      --theory:#ff3b3b; /* red theoretical marker */
     }
     *{box-sizing:border-box}
     body{
@@ -174,6 +175,20 @@
       line-height:1.35;
       margin:0;
     }
+    .legend{
+      display:flex;
+      gap:14px;
+      flex-wrap:wrap;
+      margin-top:8px;
+      color:var(--muted);
+      font-size:13px;
+      align-items:center;
+    }
+    .swatch{
+      width:14px; height:10px; border-radius:3px; display:inline-block; margin-right:8px;
+      border:1px solid rgba(255,255,255,.18);
+      vertical-align:middle;
+    }
     .danger-btn{
       appearance:none; border:none; cursor:pointer;
       padding:12px 14px; border-radius:16px;
@@ -227,7 +242,8 @@
       <div>
         <h1>Catan Dice (2d6) — Fair</h1>
         <p class="subtitle">
-          Rolls use Web Crypto and are saved locally in your browser (last 100). Use the Statistics tab to view the distribution.
+          Statistics auto-initializes with 1500 silent rolls (not shown on the dice page). Statistics always uses the last 1500 results.
+          The red marker on each bar is the theoretical expected count for that sum.
         </p>
       </div>
       <div class="topbar">
@@ -278,21 +294,21 @@
           </div>
 
           <div class="last3" id="last3Box">
-            <h3>Last 3 results</h3>
+            <h3>Last 3 real results</h3>
             <ul class="last3-list" id="last3List"></ul>
           </div>
 
           <div class="meta">
-            <div id="countInfoDice">Stored rolls: 0 / 100</div>
-            <div id="lastInfoDice">Last roll: —</div>
+            <div id="countInfoDice">Real rolls: 0</div>
+            <div id="lastInfoDice">Last real roll: —</div>
           </div>
         </div>
 
         <div class="card side-actions">
           <p class="note">
-            Keyboard: Space / Enter rolls the dice. Statistics is based on the last 100 rolls stored on this device/browser.
+            Statistics uses last 1500 results (seeded once + your real rolls). The dice page shows only your real rolls.
           </p>
-          <button class="danger-btn" id="clearHistoryBtn">Clear stored history</button>
+          <button class="danger-btn" id="clearHistoryBtn">Clear real + stats history</button>
         </div>
       </div>
     </section>
@@ -302,17 +318,24 @@
       <div class="card stat-wrap">
         <canvas id="chart" width="980" height="420" aria-label="Statistics chart" role="img"></canvas>
 
+        <div class="legend">
+          <span><span class="swatch" style="background: rgba(122,162,255,0.85);"></span>Observed (last 1500)</span>
+          <span><span class="swatch" style="background: var(--theory);"></span>Theoretical expected</span>
+        </div>
+
         <div class="meta">
-          <div id="countInfoStats">Stored rolls: 0 / 100</div>
-          <div id="lastInfoStats">Last roll: —</div>
+          <div id="countInfoStats">Stats rolls: 0 / 1500</div>
+          <div id="lastInfoStats">Last stats roll: —</div>
         </div>
 
         <table class="table" aria-label="Frequency table">
           <thead>
             <tr>
               <th>Sum</th>
-              <th>Count</th>
-              <th>Percent</th>
+              <th>Observed</th>
+              <th>Theoretical</th>
+              <th>Observed %</th>
+              <th>Theoretical %</th>
             </tr>
           </thead>
           <tbody id="freqBody"></tbody>
@@ -325,10 +348,20 @@
 (() => {
   "use strict";
 
-  // ----- constants / storage -----
+  // ----- constants -----
   const faces = ["", "⚀","⚁","⚂","⚃","⚄","⚅"];
-  const STORAGE_KEY = "catanDice.rolls.v1"; // array of {t, d1, d2, sum}
-  const MAX_ROLLS = 100;
+
+  const MAX_STATS = 1500;
+
+  // Separate histories:
+  // - REAL: shown on main page ("last 3 real results")
+  // - STATS: used for statistics; auto-seeded once to 1500 silent rolls
+  const KEY_REAL  = "catanDice.realRolls.v2";   // array of {t, d1, d2, sum}
+  const KEY_STATS = "catanDice.statsRolls.v2";  // array of {t, d1, d2, sum}
+  const KEY_SEEDED = "catanDice.statsSeeded.v2"; // "1" when seeded
+
+  // Theoretical weights for sums 2..12 (out of 36)
+  const THEORY_W = {2:1,3:2,4:3,5:4,6:5,7:6,8:5,9:4,10:3,11:2,12:1};
 
   // ----- elements: tabs/pages -----
   const tabDice = document.getElementById("tabDice");
@@ -379,30 +412,54 @@
   }
 
   // ----- helpers: storage -----
-  function loadRolls() {
+  function load(key) {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(key);
       if (!raw) return [];
       const data = JSON.parse(raw);
       if (!Array.isArray(data)) return [];
       return data
         .filter(r => r && Number.isInteger(r.d1) && Number.isInteger(r.d2) && Number.isInteger(r.sum))
-        .slice(-MAX_ROLLS);
+        .filter(r => r.sum >= 2 && r.sum <= 12);
     } catch {
       return [];
     }
   }
 
-  function saveRolls(rolls) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(rolls.slice(-MAX_ROLLS)));
+  function save(key, arr, maxLen) {
+    const out = (typeof maxLen === "number") ? arr.slice(-maxLen) : arr;
+    localStorage.setItem(key, JSON.stringify(out));
   }
 
-  function addRoll(d1, d2) {
-    const rolls = loadRolls();
-    const entry = { t: Date.now(), d1, d2, sum: d1 + d2 };
-    rolls.push(entry);
-    saveRolls(rolls);
-    return rolls.slice(-MAX_ROLLS);
+  function addToReal(d1, d2) {
+    const arr = load(KEY_REAL);
+    arr.push({ t: Date.now(), d1, d2, sum: d1 + d2 });
+    save(KEY_REAL, arr); // no limit required for real; keep it simple
+    return arr;
+  }
+
+  function addToStats(d1, d2) {
+    const arr = load(KEY_STATS);
+    arr.push({ t: Date.now(), d1, d2, sum: d1 + d2 });
+    save(KEY_STATS, arr, MAX_STATS);
+    return arr.slice(-MAX_STATS);
+  }
+
+  // Seed stats once (silent rolls) to exactly 1500 results
+  function seedStatsIfNeeded() {
+    const seeded = localStorage.getItem(KEY_SEEDED) === "1";
+    const stats = load(KEY_STATS);
+    if (seeded && stats.length > 0) return;
+
+    // Build 1500 silent rolls into KEY_STATS
+    const seededArr = [];
+    for (let i = 0; i < MAX_STATS; i++) {
+      const d1 = cryptoRandomInt(1, 6);
+      const d2 = cryptoRandomInt(1, 6);
+      seededArr.push({ t: Date.now() - (MAX_STATS - i) * 10, d1, d2, sum: d1 + d2 });
+    }
+    save(KEY_STATS, seededArr, MAX_STATS);
+    localStorage.setItem(KEY_SEEDED, "1");
   }
 
   // ----- helpers: UI -----
@@ -431,16 +488,16 @@
     }
   }
 
-  // ----- last 3 results UI -----
-  function renderLast3() {
-    const rolls = loadRolls();
-    const last3 = rolls.slice(-3).reverse(); // most recent first
+  // ----- main page: last 3 real results -----
+  function renderLast3Real() {
+    const real = load(KEY_REAL);
+    const last3 = real.slice(-3).reverse();
 
     last3ListEl.innerHTML = "";
     if (last3.length === 0) {
       const li = document.createElement("li");
       li.className = "last3-item";
-      li.innerHTML = `<span class="k">No rolls yet</span><span class="v">—</span>`;
+      li.innerHTML = `<span class="k">No real rolls yet</span><span class="v">—</span>`;
       last3ListEl.appendChild(li);
       return;
     }
@@ -455,20 +512,23 @@
     }
   }
 
-  function syncDiceFromStorage() {
-    const rolls = loadRolls();
-    const total = rolls.length;
+  function syncDiceFromReal() {
+    const real = load(KEY_REAL);
+    const total = real.length;
 
-    countInfoDiceEl.textContent = `Stored rolls: ${total} / ${MAX_ROLLS}`;
+    countInfoDiceEl.textContent = `Real rolls: ${total}`;
     if (total > 0) {
-      const last = rolls[total - 1];
-      lastInfoDiceEl.textContent = `Last roll: ${last.d1} + ${last.d2} = ${last.sum} at ${formatTime(last.t)}`;
+      const last = real[total - 1];
+      lastInfoDiceEl.textContent = `Last real roll: ${last.d1} + ${last.d2} = ${last.sum} at ${formatTime(last.t)}`;
       setDie(die1Face, die1El, last.d1, "Die 1");
       setDie(die2Face, die2El, last.d2, "Die 2");
       sumEl.textContent = String(last.sum);
       showSevenBanner(last.sum === 7);
     } else {
-      lastInfoDiceEl.textContent = "Last roll: —";
+      lastInfoDiceEl.textContent = "Last real roll: —";
+      setDie(die1Face, die1El, 1, "Die 1");
+      setDie(die2Face, die2El, 1, "Die 2");
+      sumEl.textContent = "2";
       showSevenBanner(false);
     }
   }
@@ -551,11 +611,13 @@
       sumEl.textContent = String(s);
       showSevenBanner(s === 7);
 
-      addRoll(d1, d2);
+      // Add to both histories:
+      addToReal(d1, d2);
+      addToStats(d1, d2);
 
-      renderLast3();
-      syncDiceFromStorage();
-      renderStats(); // keep stats page up-to-date if user switches
+      renderLast3Real();
+      syncDiceFromReal();
+      renderStats(); // keep stats ready
 
       isRolling = false;
       rollBtn.disabled = false;
@@ -582,20 +644,26 @@
   }
 
   // ----- statistics -----
-  function computeFreq(rolls) {
+  function computeObservedFreq(statsRolls) {
     const freq = {};
     for (let s = 2; s <= 12; s++) freq[s] = 0;
-    for (const r of rolls) {
-      if (r && Number.isInteger(r.sum) && r.sum >= 2 && r.sum <= 12) freq[r.sum] += 1;
-    }
+    for (const r of statsRolls) freq[r.sum] += 1;
     return freq;
+  }
+
+  function computeTheoreticalCounts(total) {
+    const theo = {};
+    for (let s = 2; s <= 12; s++) {
+      theo[s] = total * (THEORY_W[s] / 36);
+    }
+    return theo;
   }
 
   function clearCanvas() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }
 
-  function drawChart(freq, total) {
+  function drawChart(observed, theoretical, total) {
     clearCanvas();
 
     const W = canvas.width;
@@ -618,7 +686,10 @@
     ctx.lineTo(padL + plotW, padT + plotH);
     ctx.stroke();
 
-    const maxCount = Math.max(1, ...Object.values(freq));
+    // Scale to max of observed vs theoretical so red markers always visible
+    const maxObs = Math.max(1, ...Object.values(observed));
+    const maxTheo = Math.max(1, ...Object.values(theoretical));
+    const maxCount = Math.max(maxObs, maxTheo);
 
     // y grid/ticks
     ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, Arial";
@@ -648,27 +719,42 @@
 
     for (let i = 0; i < sums.length; i++) {
       const s = sums[i];
-      const c = freq[s];
-      const barH = (c / maxCount) * plotH;
 
-      const x = padL + i * (barW + gap);
-      const y = padT + plotH - barH;
+      const obs = observed[s];
+      const theo = theoretical[s];
 
+      const obsH = (obs / maxCount) * plotH;
+      const obsX = padL + i * (barW + gap);
+      const obsY = padT + plotH - obsH;
+
+      // observed bar (blue)
       ctx.fillStyle = "rgba(122,162,255,0.85)";
-      ctx.fillRect(x, y, barW, barH);
+      ctx.fillRect(obsX, obsY, barW, obsH);
 
       ctx.strokeStyle = "rgba(255,255,255,0.18)";
-      ctx.strokeRect(x, y, barW, barH);
+      ctx.strokeRect(obsX, obsY, barW, obsH);
 
+      // theoretical marker (red horizontal line at expected height)
+      const theoY = padT + plotH - ((theo / maxCount) * plotH);
+      ctx.strokeStyle = "rgba(255,59,59,0.95)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(obsX, theoY);
+      ctx.lineTo(obsX + barW, theoY);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+
+      // x labels
       ctx.fillStyle = "rgba(255,255,255,0.85)";
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
-      ctx.fillText(String(s), x + barW/2, padT + plotH + 10);
+      ctx.fillText(String(s), obsX + barW/2, padT + plotH + 10);
 
+      // observed count on top
       ctx.fillStyle = "rgba(255,255,255,0.90)";
       ctx.textAlign = "center";
       ctx.textBaseline = "bottom";
-      ctx.fillText(String(c), x + barW/2, y - 6);
+      ctx.fillText(String(obs), obsX + barW/2, obsY - 6);
     }
 
     // title
@@ -676,40 +762,45 @@
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
     ctx.font = "14px system-ui, -apple-system, Segoe UI, Roboto, Arial";
-    ctx.fillText(`Distribution of sums (n=${total})`, padL, padT);
+    ctx.fillText(`Observed vs theoretical (n=${total})`, padL, padT);
   }
 
-  function renderTable(freq, total) {
+  function renderTable(observed, theoretical, total) {
     freqBodyEl.innerHTML = "";
     for (let s = 2; s <= 12; s++) {
-      const c = freq[s];
-      const pct = total > 0 ? (100 * c / total) : 0;
+      const obs = observed[s];
+      const theo = theoretical[s];
+      const obsPct = total > 0 ? (100 * obs / total) : 0;
+      const theoPct = (THEORY_W[s] / 36) * 100;
 
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td style="text-align:left; font-weight:900;">${s}</td>
-        <td>${c}</td>
-        <td>${pct.toFixed(1)}%</td>
+        <td>${obs}</td>
+        <td>${theo.toFixed(1)}</td>
+        <td>${obsPct.toFixed(2)}%</td>
+        <td>${theoPct.toFixed(2)}%</td>
       `;
       freqBodyEl.appendChild(tr);
     }
   }
 
   function renderStats() {
-    const rolls = loadRolls();
-    const total = rolls.length;
-    const freq = computeFreq(rolls);
+    const stats = load(KEY_STATS).slice(-MAX_STATS);
+    const total = stats.length;
+    const observed = computeObservedFreq(stats);
+    const theoretical = computeTheoreticalCounts(total);
 
-    countInfoStatsEl.textContent = `Stored rolls: ${total} / ${MAX_ROLLS}`;
+    countInfoStatsEl.textContent = `Stats rolls: ${total} / ${MAX_STATS}`;
     if (total > 0) {
-      const last = rolls[total - 1];
-      lastInfoStatsEl.textContent = `Last roll: ${last.d1} + ${last.d2} = ${last.sum} at ${formatTime(last.t)}`;
+      const last = stats[total - 1];
+      lastInfoStatsEl.textContent = `Last stats roll: ${last.d1} + ${last.d2} = ${last.sum} at ${formatTime(last.t)}`;
     } else {
-      lastInfoStatsEl.textContent = "Last roll: —";
+      lastInfoStatsEl.textContent = "Last stats roll: —";
     }
 
-    drawChart(freq, total);
-    renderTable(freq, total);
+    drawChart(observed, theoretical, total);
+    renderTable(observed, theoretical, total);
   }
 
   // ----- page switching -----
@@ -728,10 +819,9 @@
 
   // ----- events -----
   rollBtn.addEventListener("click", rollDice);
+
   document.addEventListener("keydown", (e) => {
-    // Avoid rolling when user is on stats page and presses Space to scroll
     if (e.code === "Space" || e.code === "Enter") {
-      // Only roll if dice page is visible
       if (!pageDice.classList.contains("active")) return;
       e.preventDefault();
       rollDice();
@@ -739,7 +829,10 @@
   });
 
   clearHistoryBtn.addEventListener("click", () => {
-    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(KEY_REAL);
+    localStorage.removeItem(KEY_STATS);
+    localStorage.removeItem(KEY_SEEDED);
+
     clearAnimation();
     isRolling = false;
     rollBtn.disabled = false;
@@ -749,15 +842,19 @@
     sumEl.textContent = "2";
     showSevenBanner(false);
 
-    renderLast3();
-    syncDiceFromStorage();
+    // Re-seed stats immediately (silent)
+    seedStatsIfNeeded();
+
+    renderLast3Real();
+    syncDiceFromReal();
     renderStats();
   });
 
   // ----- init -----
-  renderLast3();
-  syncDiceFromStorage();
-  renderStats(); // pre-render; tab will show when switched
+  seedStatsIfNeeded();      // silent 1500 rolls before first use (stats only)
+  renderLast3Real();        // real only
+  syncDiceFromReal();       // real only
+  renderStats();            // stats page ready
 })();
 </script>
 </body>
